@@ -415,8 +415,6 @@ class _AddAccountScreenState extends State<AddAccountScreen> {
               ),
             ],
           ),
-          if (_isWebViewLoading)
-            const Center(child: CircularProgressIndicator()),
           if (_isProcessingAccount)
             Container(
               color: Colors.black54,
