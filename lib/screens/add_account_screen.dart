@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -21,19 +22,126 @@ class _AddAccountScreenState extends State<AddAccountScreen> {
   bool _isLoading = false;
 
   InAppWebViewController? _webViewController;
-  bool _isWebViewLoading = true;
   bool _isProcessingAccount = false;
   String _statusText = 'در حال بررسی نشست و کوکی‌ها...';
   String? _errorMessage;
 
+  Timer? _cookieCheckTimer;
+
   final String _loginUrl = 'https://www.instagram.com/accounts/login/';
 
   @override
+  void initState() {
+    super.initState();
+    // Periodically check every 1 second if sessionid is available in document.cookie
+    _cookieCheckTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!_isProcessingAccount && _webViewController != null && !kIsWeb) {
+        _checkAndExtractCookiesFast();
+      }
+    });
+  }
+
+  @override
   void dispose() {
+    _cookieCheckTimer?.cancel();
     _usernameController.dispose();
     _sessionIdController.dispose();
     _dsUserIdController.dispose();
     super.dispose();
+  }
+
+  Future<void> _checkAndExtractCookiesFast() async {
+    if (_isProcessingAccount || _webViewController == null) return;
+
+    try {
+      final jsCookies = await _webViewController!.evaluateJavascript(
+        source: 'document.cookie',
+      );
+
+      if (jsCookies != null) {
+        final cookieString = jsCookies.toString().replaceAll('"', '');
+        if (cookieString.contains('sessionid=')) {
+          _cookieCheckTimer?.cancel();
+          setState(() {
+            _isProcessingAccount = true;
+            _statusText = 'ورود موفقیت‌آمیز تشخیص داده شد! در حال ثبت اکانت...';
+          });
+
+          final Map<String, String> cookieMap = {};
+          for (var pair in cookieString.split(';')) {
+            final parts = pair.trim().split('=');
+            if (parts.length >= 2) {
+              cookieMap[parts[0].trim()] = parts.sublist(1).join('=').trim();
+            }
+          }
+
+          final sessionId = cookieMap['sessionid'];
+          final dsUserId = cookieMap['ds_user_id'];
+
+          if (sessionId != null && sessionId.isNotEmpty) {
+            final userId = dsUserId ?? 'user_${DateTime.now().millisecondsSinceEpoch}';
+
+            String userAgent = '';
+            try {
+              final uaResult = await _webViewController!
+                  .evaluateJavascript(source: 'navigator.userAgent');
+              if (uaResult != null) {
+                userAgent = uaResult.toString().replaceAll('"', '');
+              }
+            } catch (_) {}
+
+            String username = 'user_$userId';
+            try {
+              final jsResult = await _webViewController?.evaluateJavascript(
+                source:
+                    'window._sharedData?.config?.viewer?.username || (document.querySelector("a[href*=\'/$userId\']")?.textContent) || window.location.pathname.replace(/\\//g, "")',
+              );
+              if (jsResult != null &&
+                  jsResult.toString() != 'null' &&
+                  jsResult.toString().isNotEmpty) {
+                final val = jsResult.toString().replaceAll('"', '').trim();
+                if (val.isNotEmpty &&
+                    !val.contains('accounts') &&
+                    !val.contains('login') &&
+                    !val.contains('challenge') &&
+                    !val.contains('standard')) {
+                  username = val;
+                }
+              }
+            } catch (_) {}
+
+            final newAccount = InstagramAccount(
+              id: userId,
+              username: username,
+              cookies: cookieMap,
+              userAgent: userAgent,
+              status: AccountStatus.active,
+            );
+
+            if (!mounted) return;
+            final accountProvider =
+                Provider.of<AccountProvider>(context, listen: false);
+
+            await accountProvider.addOrUpdateAccount(newAccount);
+
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('✅ اکانت @$username با موفقیت وارد و ثبت شد!'),
+                backgroundColor: Colors.green,
+                duration: const Duration(seconds: 4),
+              ),
+            );
+
+            Navigator.of(context).pop();
+          } else {
+            setState(() {
+              _isProcessingAccount = false;
+            });
+          }
+        }
+      }
+    } catch (_) {}
   }
 
   Future<void> _addAccountByCookie() async {
@@ -108,219 +216,18 @@ class _AddAccountScreenState extends State<AddAccountScreen> {
       _statusText = 'در حال استخراج کوکی‌ها و ثبت اکانت...';
     });
 
-    try {
-      Map<String, String> cookieMap = {};
+    await _checkAndExtractCookiesFast();
 
-      if (_webViewController != null) {
-        try {
-          final jsCookies = await _webViewController!.evaluateJavascript(
-            source: 'document.cookie',
-          );
-          if (jsCookies != null) {
-            final cookieString = jsCookies.toString().replaceAll('"', '');
-            for (var pair in cookieString.split(';')) {
-              final parts = pair.trim().split('=');
-              if (parts.length >= 2) {
-                cookieMap[parts[0].trim()] = parts.sublist(1).join('=').trim();
-              }
-            }
-          }
-        } catch (_) {}
-      }
-
-      if (cookieMap['sessionid'] == null || cookieMap['sessionid']!.isEmpty) {
-        try {
-          final cookieManager = CookieManager.instance();
-          final cookies = await cookieManager.getCookies(
-            url: WebUri('https://www.instagram.com'),
-          );
-          for (var cookie in cookies) {
-            cookieMap[cookie.name] = cookie.value.toString();
-          }
-        } catch (_) {}
-      }
-
-      final sessionId = cookieMap['sessionid'];
-      final dsUserId = cookieMap['ds_user_id'];
-
-      if (sessionId != null && sessionId.isNotEmpty) {
-        final userId = dsUserId ?? 'user_${DateTime.now().millisecondsSinceEpoch}';
-
-        String userAgent = '';
-        if (_webViewController != null) {
-          final uaResult = await _webViewController!
-              .evaluateJavascript(source: 'navigator.userAgent');
-          if (uaResult != null) {
-            userAgent = uaResult.toString().replaceAll('"', '');
-          }
-        }
-
-        String username = 'user_$userId';
-        try {
-          final jsResult = await _webViewController?.evaluateJavascript(
-            source:
-                'window._sharedData?.config?.viewer?.username || window.location.pathname.replace(/\\//g, "")',
-          );
-          if (jsResult != null &&
-              jsResult.toString() != 'null' &&
-              jsResult.toString().isNotEmpty) {
-            final val = jsResult.toString().replaceAll('"', '').trim();
-            if (val.isNotEmpty &&
-                !val.contains('accounts') &&
-                !val.contains('login') &&
-                !val.contains('challenge') &&
-                !val.contains('standard')) {
-              username = val;
-            }
-          }
-        } catch (_) {}
-
-        final newAccount = InstagramAccount(
-          id: userId,
-          username: username,
-          cookies: cookieMap,
-          userAgent: userAgent,
-          status: AccountStatus.active,
-        );
-
-        if (!mounted) return;
-        final accountProvider =
-            Provider.of<AccountProvider>(context, listen: false);
-        await accountProvider.addOrUpdateAccount(newAccount);
-
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('✅ اکانت @$username با موفقیت ثبت و اضافه شد!'),
-            backgroundColor: Colors.green,
-            duration: const Duration(seconds: 4),
-          ),
-        );
-
-        Navigator.of(context).pop();
-      } else {
-        setState(() {
-          _isProcessingAccount = false;
-        });
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                  '⚠️ هنوز کوکی sessionid یافت نشد. لطفاً مطمئن شوید که کاملاً لاگین کرده‌اید و صفحه اصلی اینستاگرام باز است.'),
-              backgroundColor: Colors.orange,
-              duration: Duration(seconds: 5),
-            ),
-          );
-        }
-      }
-    } catch (e) {
-      setState(() {
-        _isProcessingAccount = false;
-        _errorMessage = 'خطا در ثبت اکانت: $e';
-      });
+    if (!_isProcessingAccount && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+              '⚠️ هنوز کوکی sessionid یافت نشد. لطفاً مطمئن شوید که کاملاً لاگین کرده‌اید و صفحه اینستاگرام باز است.'),
+          backgroundColor: Colors.orange,
+          duration: Duration(seconds: 5),
+        ),
+      );
     }
-  }
-
-  Future<void> _checkAndExtractCookies(WebUri? url) async {
-    if (_isProcessingAccount || url == null) return;
-
-    try {
-      Map<String, String> cookieMap = {};
-
-      if (_webViewController != null) {
-        try {
-          final jsCookies = await _webViewController!.evaluateJavascript(
-            source: 'document.cookie',
-          );
-          if (jsCookies != null) {
-            final cookieString = jsCookies.toString().replaceAll('"', '');
-            for (var pair in cookieString.split(';')) {
-              final parts = pair.trim().split('=');
-              if (parts.length >= 2) {
-                cookieMap[parts[0].trim()] = parts.sublist(1).join('=').trim();
-              }
-            }
-          }
-        } catch (_) {}
-      }
-
-      if (cookieMap['sessionid'] == null || cookieMap['sessionid']!.isEmpty) {
-        try {
-          final cookieManager = CookieManager.instance();
-          final cookies = await cookieManager.getCookies(
-            url: WebUri('https://www.instagram.com'),
-          );
-          for (var cookie in cookies) {
-            cookieMap[cookie.name] = cookie.value.toString();
-          }
-        } catch (_) {}
-      }
-
-      final sessionId = cookieMap['sessionid'];
-      final dsUserId = cookieMap['ds_user_id'];
-
-      if (sessionId != null && sessionId.isNotEmpty) {
-        setState(() {
-          _isProcessingAccount = true;
-          _statusText = 'ورود تشخیص داده شد! در حال ثبت خودکار اکانت...';
-        });
-
-        final userId = dsUserId ?? 'user_${DateTime.now().millisecondsSinceEpoch}';
-
-        String userAgent = '';
-        if (_webViewController != null) {
-          final uaResult = await _webViewController!
-              .evaluateJavascript(source: 'navigator.userAgent');
-          if (uaResult != null) {
-            userAgent = uaResult.toString().replaceAll('"', '');
-          }
-        }
-
-        String username = 'user_$userId';
-        try {
-          final jsResult = await _webViewController?.evaluateJavascript(
-            source:
-                'window._sharedData?.config?.viewer?.username || window.location.pathname.replace(/\\//g, "")',
-          );
-          if (jsResult != null &&
-              jsResult.toString() != 'null' &&
-              jsResult.toString().isNotEmpty) {
-            final val = jsResult.toString().replaceAll('"', '').trim();
-            if (val.isNotEmpty &&
-                !val.contains('accounts') &&
-                !val.contains('login') &&
-                !val.contains('challenge') &&
-                !val.contains('standard')) {
-              username = val;
-            }
-          }
-        } catch (_) {}
-
-        final newAccount = InstagramAccount(
-          id: userId,
-          username: username,
-          cookies: cookieMap,
-          userAgent: userAgent,
-          status: AccountStatus.active,
-        );
-
-        if (!mounted) return;
-        final accountProvider =
-            Provider.of<AccountProvider>(context, listen: false);
-
-        await accountProvider.addOrUpdateAccount(newAccount);
-
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('✅ اکانت @$username با موفقیت ثبت شد!'),
-            backgroundColor: Colors.green,
-          ),
-        );
-
-        Navigator.of(context).pop();
-      }
-    } catch (_) {}
   }
 
   @override
@@ -434,7 +341,6 @@ class _AddAccountScreenState extends State<AddAccountScreen> {
       appBar: AppBar(
         title: const Text('ورود به اینستاگرام'),
         actions: [
-          // Manual Save Button
           IconButton(
             icon: const Icon(Icons.check_circle, color: Colors.greenAccent, size: 28),
             tooltip: 'ثبت این اکانت (تایید ورود)',
@@ -492,31 +398,24 @@ class _AddAccountScreenState extends State<AddAccountScreen> {
                     _webViewController = controller;
                   },
                   onLoadStart: (controller, url) {
-                    setState(() {
-                      _isLoading = true;
-                    });
                   },
                   onLoadStop: (controller, url) async {
-                    setState(() {
-                      _isLoading = false;
-                    });
-                    await _checkAndExtractCookies(url);
+                    await _checkAndExtractCookiesFast();
                   },
                   onReceivedError: (controller, request, error) {
                     setState(() {
-                      _isLoading = false;
                       _errorMessage =
                           'خطا در بارگذاری صفحه: ${error.description}\nلطفاً فیلترشکن (VPN) خود را بررسی کنید.';
                     });
                   },
                   onUpdateVisitedHistory: (controller, url, isReload) async {
-                    await _checkAndExtractCookies(url);
+                    await _checkAndExtractCookiesFast();
                   },
                 ),
               ),
             ],
           ),
-          if (_isLoading)
+          if (_isWebViewLoading)
             const Center(child: CircularProgressIndicator()),
           if (_isProcessingAccount)
             Container(
